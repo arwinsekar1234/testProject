@@ -1,7 +1,7 @@
 """
-Converted from your Power Query (M) to Python (pandas).
+Converted from your Power Query (M) to Python (pandas), without lookups.xlsx.
 
-What this script does (same as PQ):
+This script:
 - Finds the latest VW_ONEMI_ESTATE_MANAGEMENT_*.xlsx in a folder
 - Loads Sheet1
 - Filters REMOVED_FLAG is null
@@ -9,7 +9,11 @@ What this script does (same as PQ):
 - Renames OneMI *_TODAY columns
 - Replaces empty/null cells in specific columns with "@_EMPTY"
 - Fills invalid DISPOSITION_TIMELINE_STEP_1 with 1900-01-01
-- Left-joins all lookup tables (as DataFrames)
+- Loads lookup tables exactly like your PQ:
+    - Settings.xlsx (Excel Tables)
+    - Schedules.xlsx (Excel Tables)
+    - NAR_ReportBaseLine.xlsx (Sheet)
+- Left-joins all lookup tables
 - Derives Location_Today + Location_Calculated
 - Derives Technology_Today + Technology_Calculated
 - Fills UNKNOWN location/technology from manual settings
@@ -18,12 +22,6 @@ What this script does (same as PQ):
 - Merges schedules, data residency, shared/dedicated tagging, DC-name based location
 - Drops many columns
 - Reorders columns
-
-This script assumes ONE Excel workbook containing sheets with these names:
-  tabUnderpinningDBServer, tabCIsettings, tabStep0settings, tabStep1settings, tabStep2settings,
-  tabS2T1settings, tabS2T2settings, tabS2T2Tsettings, NAR_ReportBaseLine, tabEAP_Grid_Consumers,
-  tabPlatformNARs, tabSchedule_V2V, tabSchedule_P2V, tabSchedule_P2P, tabData_Residency,
-  Server_Shared-Dedicate_Tagging, Location_Today2
 """
 
 from __future__ import annotations
@@ -31,10 +29,12 @@ from __future__ import annotations
 import os
 import glob
 from pathlib import Path
-from typing import Dict, List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
+
 
 # ----------------------------
 # CONFIG (EDIT THESE)
@@ -43,8 +43,11 @@ FOLDER_WITH_ONEMI_EXPORTS = r"C:\Users\arwin\OneDrive\Desktop\AID\input"
 FILE_PREFIX = "VW_ONEMI_ESTATE_MANAGEMENT_"
 SHEET_NAME_MAIN = "Sheet1"
 
-# Put your lookup workbook path here (one workbook with multiple sheets)
-LOOKUP_WORKBOOK_PATH = r"C:\Users\arwin\OneDrive\Desktop\AID\lookups.xlsx"
+# These correspond to your Power Query sources
+SETTINGS_XLSX_PATH = r"C:\Users\auerleo\Deutsche Bank AG\Technology Transformation And Integration - 08 App Infra Disposition\90 - MasterMaker\Master_Maker_2.1\Settings.xlsx"
+SCHEDULES_XLSX_PATH = r"C:\Users\auerleo\Deutsche Bank AG\Technology Transformation And Integration - 08 App Infra Disposition\90 - MasterMaker\Master_Maker_2.1\Schedules.xlsx"
+NAR_BASELINE_XLSX_PATH = r"C:\Users\auerleo\Deutsche Bank AG\Technology Transformation And Integration - 08 App Infra Disposition\90 - MasterMaker\Master_Maker_2.1\NAR_ReportBaseLine.xlsx"
+NAR_BASELINE_SHEET_NAME = "NAR_ReportBaseLine"
 
 # Output
 OUTPUT_PATH = r"C:\Users\arwin\OneDrive\Desktop\AID\estate_management_output.xlsx"
@@ -63,27 +66,65 @@ def latest_matching_excel(folder: str, prefix: str) -> str:
     return max(files, key=os.path.getmtime)
 
 
-def read_lookup_sheets(xlsx_path: str, sheet_names: List[str]) -> Dict[str, pd.DataFrame]:
-    if not xlsx_path or not Path(xlsx_path).exists():
-        raise FileNotFoundError(
-            "Lookup workbook not found. Set LOOKUP_WORKBOOK_PATH to your workbook that contains the lookup sheets."
-        )
-    out: Dict[str, pd.DataFrame] = {}
-    for s in sheet_names:
-        out[s] = pd.read_excel(xlsx_path, sheet_name=s, engine="openpyxl")
-    return out
+def ensure_exists(path: str, label: str) -> None:
+    if not path or not Path(path).exists():
+        raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def _a1_to_idx(a1: str) -> Tuple[int, int]:
+    # "A1" -> (row=1, col=1)
+    col = 0
+    row_str = ""
+    for ch in a1:
+        if ch.isalpha():
+            col = col * 26 + (ord(ch.upper()) - ord("A") + 1)
+        else:
+            row_str += ch
+    return int(row_str), int(col)
+
+
+def _range_to_bounds(rng: str) -> Tuple[int, int, int, int]:
+    # "A1:D10" -> (min_row, min_col, max_row, max_col)
+    left, right = rng.split(":")
+    r1, c1 = _a1_to_idx(left)
+    r2, c2 = _a1_to_idx(right)
+    return min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2)
+
+
+def read_excel_table(workbook_path: str, table_name: str) -> pd.DataFrame:
+    """
+    Reads an Excel *Table object* (not a sheet) by table name, like Power Query's:
+      Source{[Item="tabCIsettings",Kind="Table"]}[Data]
+    """
+    ensure_exists(workbook_path, "Workbook")
+    wb = load_workbook(workbook_path, data_only=True, read_only=True)
+
+    for ws in wb.worksheets:
+        # openpyxl stores tables in ws.tables
+        if table_name in ws.tables:
+            tbl = ws.tables[table_name]
+            min_row, min_col, max_row, max_col = _range_to_bounds(tbl.ref)
+
+            data = []
+            for row in ws.iter_rows(min_row=min_row, min_col=min_col, max_row=max_row, max_col=max_col, values_only=True):
+                data.append(list(row))
+
+            if not data:
+                return pd.DataFrame()
+
+            headers = [str(h).strip() if h is not None else "" for h in data[0]]
+            rows = data[1:]
+            df = pd.DataFrame(rows, columns=headers)
+            return df
+
+    raise KeyError(f"Excel table '{table_name}' not found in workbook: {workbook_path}")
 
 
 def fill_empty_cells(df: pd.DataFrame, cols: List[str], token: str) -> pd.DataFrame:
     for c in cols:
         if c not in df.columns:
             continue
-        s = df[c]
-        df[c] = (
-            s.astype("string")
-            .fillna("")
-            .map(lambda v: token if str(v).strip() == "" else v)
-        )
+        df[c] = df[c].astype("string").fillna("").map(lambda v: token if str(v).strip() == "" else v)
     return df
 
 
@@ -105,6 +146,154 @@ def ensure_col(df: pd.DataFrame, col: str, default) -> None:
 
 
 # ----------------------------
+# Load lookups exactly like Power Query
+# ----------------------------
+def load_tabCIsettings() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabCIsettings")
+    # PQ:
+    #  - rename "CI Summary" -> CI_Summary_File
+    #  - new "CI Summary": if contains "No response required" then "No response required" else file value
+    if "CI Summary" in df.columns:
+        df = df.rename(columns={"CI Summary": "CI_Summary_File"})
+        df["CI Summary"] = df["CI_Summary_File"].astype("string").fillna("").apply(
+            lambda x: "No response required" if "No response required" in str(x) else str(x)
+        )
+        df = df.drop(columns=["CI_Summary_File"])
+    return df
+
+
+def load_tabStep0settings() -> pd.DataFrame:
+    # PQ reads table "tabStepsettings"
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabStepsettings")
+    # Keep the columns as-is; joins expect Technology Today vs Technology_Today mismatch handled later
+    return df
+
+
+def load_tabStep1settings() -> pd.DataFrame:
+    return read_excel_table(SETTINGS_XLSX_PATH, "tabStep1settings")
+
+
+def load_tabStep2settings() -> pd.DataFrame:
+    return read_excel_table(SETTINGS_XLSX_PATH, "tabStep2settings")
+
+
+def load_tabS2T1settings() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabS2T1settings")
+    # Your main PQ expects: "S2T1-CIO to Dispo Chase" (but the snippet shows "Dispo Chase")
+    # In the saved versions you had both; handle safely:
+    if "Dispo Chase" in df.columns and "S2T1-CIO to Dispo Chase" not in df.columns:
+        df = df.rename(columns={"Dispo Chase": "S2T1-CIO to Dispo Chase"})
+    return df
+
+
+def load_tabS2T2settings() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabS2T2settings")
+    if "Dispo Chase" in df.columns and "S2T2-CIO to Dispo Chase" not in df.columns:
+        df = df.rename(columns={"Dispo Chase": "S2T2-CIO to Dispo Chase"})
+    return df
+
+
+def load_tabS2T2Tsettings() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabS2T2Tsettings")
+    # Main python expects "CIO Chase YN" not "CIO Decision" in some earlier versions
+    if "CIO Decision" in df.columns and "CIO Chase YN" not in df.columns:
+        df = df.rename(columns={"CIO Decision": "CIO Chase YN"})
+    return df
+
+
+def load_NAR_ReportBaseLine() -> pd.DataFrame:
+    ensure_exists(NAR_BASELINE_XLSX_PATH, "NAR baseline workbook")
+    df = pd.read_excel(NAR_BASELINE_XLSX_PATH, sheet_name=NAR_BASELINE_SHEET_NAME, engine="openpyxl")
+    return df
+
+
+def load_tabPlatformNARs() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabPlatformNARs")
+    # PQ rename ReturnValue -> Platform_Provider, replace yes -> Yes
+    if "ReturnValue" in df.columns:
+        df = df.rename(columns={"ReturnValue": "Platform_Provider"})
+    if "Platform_Provider" in df.columns:
+        df["Platform_Provider"] = df["Platform_Provider"].astype("string").fillna("").str.replace("yes", "Yes", regex=False)
+    return df
+
+
+def load_tabSchedule_V2V() -> pd.DataFrame:
+    df = read_excel_table(SCHEDULES_XLSX_PATH, "tabSchedule_V2V")
+    # PQ: replace null Full_Server_Name with "@_Empty"
+    if "Full_Server_Name" in df.columns:
+        df["Full_Server_Name"] = df["Full_Server_Name"].astype("string").fillna("@_Empty")
+    # PQ: replace "United Kingdom" -> "UK" in Country
+    if "Country" in df.columns:
+        df["Country"] = df["Country"].astype("string").fillna("").str.replace("United Kingdom", "UK", regex=False)
+
+    # PQ adds V2V-Scope from "Migration wave"
+    # (your stored V2V query also renames wave start/end columns; we keep any columns that exist)
+    if "Migration wave" in df.columns:
+        def v2v_scope(row) -> str:
+            wave = str(row.get("Migration wave", "") or "")
+            country = str(row.get("Country", "") or "")
+            if "subnet not found" in wave:
+                return f"{country}-TBC"
+            if "subnet without virtual instance" in wave:
+                return f"{country}-TBC"
+            return wave
+        df["V2V-Scope"] = df.apply(v2v_scope, axis=1)
+
+    return df
+
+
+def load_tabSchedule_P2V() -> pd.DataFrame:
+    return read_excel_table(SCHEDULES_XLSX_PATH, "tabSchedule_P2V")
+
+
+def load_tabSchedule_P2P() -> pd.DataFrame:
+    return read_excel_table(SCHEDULES_XLSX_PATH, "tabSchedule_P2P")
+
+
+def load_tabData_Residency() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "Data_Residency")
+    # PQ renames "Data Residency" -> "Data_Residency"
+    if "Data Residency" in df.columns:
+        df = df.rename(columns={"Data Residency": "Data_Residency"})
+    return df
+
+
+def load_tabUnderpinningDBServer() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "Database_server_Name")
+    # PQ distinct by SERVER_NAME (we do that)
+    if "SERVER_NAME" in df.columns:
+        df = df.drop_duplicates(subset=["SERVER_NAME"], keep="first").copy()
+    # Some versions also have Underpinning_Server_CIs; keep whatever exists
+    return df
+
+
+def load_Location_Today2() -> pd.DataFrame:
+    return read_excel_table(SETTINGS_XLSX_PATH, "Location_Today")
+
+
+def load_tabEAP_Grid_Consumers() -> pd.DataFrame:
+    df = read_excel_table(SETTINGS_XLSX_PATH, "tabEAP_Grid_Consumers")
+    # PQ renames Status -> EAP/Grid Consumer
+    if "Status" in df.columns:
+        df = df.rename(columns={"Status": "EAP/Grid Consumer"})
+    return df
+
+
+# NOTE: You didn’t paste M for Server_Shared-Dedicate_Tagging in this message,
+# but your main query uses it. You already had it earlier in the conversation memory.
+# So we load it as a function expecting it to be available as a TABLE in Settings.xlsx
+# If your real source is different, update this function accordingly.
+def load_Server_Shared_Dedicate_Tagging() -> pd.DataFrame:
+    # If you already have it as an Excel Table named exactly like PQ query name:
+    # try to read it; otherwise you must point to its real workbook source.
+    try:
+        return read_excel_table(SETTINGS_XLSX_PATH, "Server_Shared-Dedicate_Tagging")
+    except Exception:
+        # Fallback name used in some workbooks
+        return read_excel_table(SETTINGS_XLSX_PATH, "Server_Shared-Dedicate_Tagging".replace("-", "_"))
+
+
+# ----------------------------
 # Core transformations
 # ----------------------------
 def compute_location_today(r: pd.Series) -> str:
@@ -121,7 +310,7 @@ def compute_location_today(r: pd.Series) -> str:
     ):
         return "HUB"
 
-    # Blaupause (Mainframe) Locations
+    # Blaupause
     if country == "GERMANY" and building in {"GABLONZER STRASSE 34 (DCO)", "BISMARCKSTRASSE 2 (DCS)"}:
         return "Blaupause"
 
@@ -163,23 +352,18 @@ def compute_technology_today(r: pd.Series) -> str:
     server_type = str(r.get("SERVER_TYPE", "") or "")
     host_type = str(r.get("HOST_TYPE", "") or "")
 
-    # Oracle Non-real databases
     if ci_cat == "DATABASE" and is_actual_db == "N":
         return "No response required (No real Oracle DB)"
 
-    # GCP CIs
     if "ZONE" in building:
         return "No response required (GCP CIs)"
 
-    # SERVER CI-underpinning database
     if ci_cat == "SERVER" and underpin == "Y":
         return "No response required (Server underpinning CI Database)"
 
-    # Application Components / PaaS
     if service in {"DAP", "dWeb", "Fabric"}:
         return "PaaS"
 
-    # DATABASES
     if ci_cat == "DATABASE" and db_type == "MICROSOFT" and "MICROSOFT SQL SERVER" in db_ver:
         return "SQL"
 
@@ -204,14 +388,9 @@ def compute_technology_today(r: pd.Series) -> str:
     }:
         return "Oracle Legacy"
 
-    # SERVERS
     if ci_cat == "SERVER" and instance_name in {
-        "DAP-GRLOBAL",
-        "dWEB-GRLOBAL",
-        "FABRIC-GLOBAL",
-        "EAP-tools",
-        "EAP-UK-Big Data Platform",
-        "EAP-DE-Big Data Platform",
+        "DAP-GRLOBAL", "dWEB-GRLOBAL", "FABRIC-GLOBAL", "EAP-tools",
+        "EAP-UK-Big Data Platform", "EAP-DE-Big Data Platform",
     }:
         return "Hosting - PaaS"
 
@@ -348,30 +527,32 @@ def run_pipeline() -> pd.DataFrame:
         dt = pd.to_datetime(df["DISPOSITION_TIMELINE_STEP_1"], errors="coerce")
         df["DISPOSITION_TIMELINE_STEP_1"] = dt.fillna(pd.Timestamp("1900-01-01")).dt.date
 
-    # Load lookups
-    lookup_sheet_names = [
-        "tabUnderpinningDBServer",
-        "tabCIsettings",
-        "tabStep0settings",
-        "tabStep1settings",
-        "tabStep2settings",
-        "tabS2T1settings",
-        "tabS2T2settings",
-        "tabS2T2Tsettings",
-        "NAR_ReportBaseLine",
-        "tabEAP_Grid_Consumers",
-        "tabPlatformNARs",
-        "tabSchedule_V2V",
-        "tabSchedule_P2V",
-        "tabSchedule_P2P",
-        "tabData_Residency",
-        "Server_Shared-Dedicate_Tagging",
-        "Location_Today2",
-    ]
-    lookups = read_lookup_sheets(LOOKUP_WORKBOOK_PATH, lookup_sheet_names)
+    # ----------------------------
+    # Load lookups from real sources (like PQ)
+    # ----------------------------
+    tabUnderpinningDBServer = load_tabUnderpinningDBServer()
+    tabCIsettings = load_tabCIsettings()
+    tabStep0settings = load_tabStep0settings()
+    tabStep1settings = load_tabStep1settings()
+    tabStep2settings = load_tabStep2settings()
+    tabS2T1settings = load_tabS2T1settings()
+    tabS2T2settings = load_tabS2T2settings()
+    tabS2T2Tsettings = load_tabS2T2Tsettings()
+    NAR_ReportBaseLine = load_NAR_ReportBaseLine()
+    tabEAP_Grid_Consumers = load_tabEAP_Grid_Consumers()
+    tabPlatformNARs = load_tabPlatformNARs()
+    tabSchedule_V2V = load_tabSchedule_V2V()
+    tabSchedule_P2V = load_tabSchedule_P2V()
+    tabSchedule_P2P = load_tabSchedule_P2P()
+    tabData_Residency = load_tabData_Residency()
+    Server_Shared_Dedicate_Tagging = load_Server_Shared_Dedicate_Tagging()
+    Location_Today2 = load_Location_Today2()
 
+    # ----------------------------
     # Merge underpinning DB server
-    df = left_merge(df, lookups["tabUnderpinningDBServer"], ["SERVER_NAME"], ["SERVER_NAME"])
+    # PQ expands {"Flag","Underpinning_Server_CIs"} if present
+    # ----------------------------
+    df = left_merge(df, tabUnderpinningDBServer, ["SERVER_NAME"], ["SERVER_NAME"])
 
     # Location_Today + calculated flag
     ensure_col(df, "COUNTRY", None)
@@ -380,7 +561,7 @@ def run_pipeline() -> pd.DataFrame:
     df["Location_Today"] = df.apply(compute_location_today, axis=1)
     df["Location_Calculated"] = np.where(df["Location_Today"] != "UNKNOWN", "Calculated", "Manual")
 
-    # Create HUB_LOCATION to match your later logic (PQ referenced HUB_LOCATION)
+    # HUB_LOCATION for later V2V sub-scope logic
     df["HUB_LOCATION"] = np.where(df["Location_Today"] == "HUB", "Y", "N")
 
     # Technology_Today + calculated flag
@@ -388,7 +569,7 @@ def run_pipeline() -> pd.DataFrame:
     df["Technology_Calculated"] = np.where(df["Technology_Today"] != "UNKNOWN", "Calculated", "Manual")
 
     # Merge CI settings
-    df = left_merge(df, lookups["tabCIsettings"], ["PLANNER_UNIQUE_IDENTIFIER"], ["PLANNER_UNIQUE_IDENTIFIER"])
+    df = left_merge(df, tabCIsettings, ["PLANNER_UNIQUE_IDENTIFIER"], ["PLANNER_UNIQUE_IDENTIFIER"])
 
     # Fill UNKNOWN with manual data
     if "Location Manually" in df.columns:
@@ -426,33 +607,40 @@ def run_pipeline() -> pd.DataFrame:
     df["S2T-1"] = df["DISPOSITION_OPTION_STEP_1"].astype(str)
     df["S2T-2"] = df["DISPOSITION_OPTION_STEP_1"].astype(str) + "_" + df["DISPOSITION_OPTION_STEP_2"].astype(str)
 
-    # Step 19/20 merges: step0/1/2 + S2T groupings
-    df = left_merge(df, lookups["tabStep0settings"], ["Technology_Today"], ["Technology_Today"])
-    df = left_merge(df, lookups["tabStep1settings"], ["DISPOSITION_OPTION_STEP_1"], ["DISPOSITION_OPTION_STEP_1"])
-    df = left_merge(df, lookups["tabStep2settings"], ["DISPOSITION_OPTION_STEP_2"], ["DISPOSITION_OPTION_STEP_2"])
-    df = left_merge(df, lookups["tabS2T1settings"], ["S2T-1"], ["S2T1"])
-    df = left_merge(df, lookups["tabS2T2settings"], ["S2T-2"], ["S2T2"])
-    df = left_merge(df, lookups["tabS2T2Tsettings"], ["S2T2T"], ["S2T2T"])
+    # Step0 merge: PQ uses tabStepsettings, keyed on Technology Today.
+    # Your main table uses Technology_Today, your settings uses "Technology Today" -> map to a common name.
+    if "Technology Today" in tabStep0settings.columns and "Technology_Today" not in tabStep0settings.columns:
+        tabStep0settings = tabStep0settings.rename(columns={"Technology Today": "Technology_Today"})
+    df = left_merge(df, tabStep0settings, ["Technology_Today"], ["Technology_Today"])
 
-    # Step 21 NAR baseline
-    df = left_merge(df, lookups["NAR_ReportBaseLine"], ["NAR_INSTANCE_ID"], ["NAR ID"])
+    # Step1/Step2 merges
+    df = left_merge(df, tabStep1settings, ["DISPOSITION_OPTION_STEP_1"], ["DISPOSITION_OPTION_STEP_1"])
+    df = left_merge(df, tabStep2settings, ["DISPOSITION_OPTION_STEP_2"], ["DISPOSITION_OPTION_STEP_2"])
+
+    # S2T merges
+    df = left_merge(df, tabS2T1settings, ["S2T-1"], ["S2T1"])
+    df = left_merge(df, tabS2T2settings, ["S2T-2"], ["S2T2"])
+    df = left_merge(df, tabS2T2Tsettings, ["S2T2T"], ["S2T2T"])
+
+    # NAR baseline
+    df = left_merge(df, NAR_ReportBaseLine, ["NAR_INSTANCE_ID"], ["NAR ID"])
     if "Certified Decom Candidate" in df.columns:
         df = df.rename(columns={"Certified Decom Candidate": "NAR App Status Decom"})
     if "Instance Planned Retirement Date" in df.columns:
         df = df.rename(columns={"Instance Planned Retirement Date": "NAR App Planned Retirement Date"})
 
-    # Step 22 EAP consumers
-    df = left_merge(df, lookups["tabEAP_Grid_Consumers"], ["NAR_INSTANCE_ID"], ["NAR ID"])
+    # EAP consumers
+    df = left_merge(df, tabEAP_Grid_Consumers, ["NAR_INSTANCE_ID"], ["NAR ID"])
 
-    # Step 23 Platform NARs
-    df = left_merge(df, lookups["tabPlatformNARs"], ["NAR_INSTANCE_ID"], ["NAR ID"])
+    # Platform NARs
+    df = left_merge(df, tabPlatformNARs, ["NAR_INSTANCE_ID"], ["NAR ID"])
 
     # Remove helper columns
     for c in ["Location Manually", "Technology Manually"]:
         if c in df.columns:
             df = df.drop(columns=[c])
 
-    # Step 25 chase decision columns
+    # Chase decision columns
     def chase_decision(dispo_col: str, chase_flag_col: str) -> pd.Series:
         ensure_col(df, "ChaserBlocker", "")
         ensure_col(df, chase_flag_col, "")
@@ -481,13 +669,12 @@ def run_pipeline() -> pd.DataFrame:
     df["Step1-Time Chase Decision"] = chase_decision("DISPOSITION_TIMELINE_STEP_1", "S2T1-CIO to Time Chase")
     df["Step2-Time Chase Decision"] = chase_decision("DISPOSITION_TIMELINE_STEP_2", "S2T2-CIO to Time Chase")
 
-    # Step 26 schedules
-    df = left_merge(df, lookups["tabSchedule_V2V"], ["SERVER_NAME"], ["Full_Server_Name"])
-    df = left_merge(df, lookups["tabSchedule_P2V"], ["SERVER_NAME"], ["SERVER_NAME"])
-    df = left_merge(df, lookups["tabSchedule_P2P"], ["SERVER_NAME"], ["SERVER_NAME"])
+    # Schedules
+    df = left_merge(df, tabSchedule_V2V, ["SERVER_NAME"], ["Full_Server_Name"])
+    df = left_merge(df, tabSchedule_P2V, ["SERVER_NAME"], ["SERVER_NAME"])
+    df = left_merge(df, tabSchedule_P2P, ["SERVER_NAME"], ["SERVER_NAME"])
 
-    # Part of Migration Initiative (P2V, P2P, V2V)
-    # ✅ Robust fix (avoids NumPy dtype promotion AND avoids pandas.NA boolean ambiguity)
+    # Part of Migration Initiative (P2V, P2P, V2V) - robust fix (no NA ambiguity)
     ensure_col(df, "V2V-Scope", "")
     ensure_col(df, "P2P Scope", "")
     v2v = df["V2V-Scope"].astype("string").fillna("").str.strip()
@@ -496,14 +683,14 @@ def run_pipeline() -> pd.DataFrame:
     df["Part of Migration Initiative (P2V, P2P, V2V)"] = ""
     df.loc[mask, "Part of Migration Initiative (P2V, P2P, V2V)"] = "Yes"
 
-    # Step 27 Replace EMPTY -> "No" for these
+    # Replace EMPTY -> "No" for these
     df = fill_empty_cells(
         df,
         cols=["EAP/Grid Consumer", "Platform_Provider", "Baseline Aug", "Baseline Sept", "Baseline Oct", "Baseline Nov", "Baseline Dec"],
         token="No",
     )
 
-    # Step 28 Remove columns from OneMI EM (your big drop list)
+    # Remove columns (your big drop list)
     cols_to_drop = [
         "IG_ROW_UPDATE_ALLOWED","ESTATE_MANAGEMENT_SCOPE","REPORTING_GROUP","SCHEDULING_RECID","LINE_OF_BUSINESS",
         "PLANNING_ID","TREATMENT","TARGET_ACTUAL","COMMENTS","PEAKOFPEAKSCPUUSAGE","AVGCPUUSAGE","CORES",
@@ -529,26 +716,26 @@ def run_pipeline() -> pd.DataFrame:
     ]
     df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors="ignore")
 
-    # Step 30 Data Residency
-    df = left_merge(df, lookups["tabData_Residency"], ["NAR_INSTANCE_ID"], ["NAR-ID"])
+    # Data Residency
+    df = left_merge(df, tabData_Residency, ["NAR_INSTANCE_ID"], ["NAR-ID"])
 
-    # Step 31 V2V Sub Scope
+    # V2V Sub Scope
     df["V2V Sub Scope"] = df.apply(compute_v2v_sub_scope, axis=1)
 
-    # Step 32 Vendor_Today
+    # Vendor_Today
     df["Vendor_Today"] = df.apply(compute_vendor_today, axis=1)
 
-    # Step 33 Shared/Dedicate tagging
-    df = left_merge(df, lookups["Server_Shared-Dedicate_Tagging"], ["SERVER_NAME"], ["SERVER_NAME"])
-    if "SharedDedicated_Server" in df.columns:
+    # Shared/Dedicate tagging
+    df = left_merge(df, Server_Shared_Dedicate_Tagging, ["SERVER_NAME"], ["SERVER_NAME"])
+    if "SharedDedicated_Server" in df.columns and "Shared\\Dedicate_Server" not in df.columns:
         df = df.rename(columns={"SharedDedicated_Server": "Shared\\Dedicate_Server"})
 
-    # Merge Location_Today2 on HP_DC_NAME
-    df = left_merge(df, lookups["Location_Today2"], ["HP_DC_NAME"], ["HP_DC_NAME"])
-    if "Location_Today" in lookups["Location_Today2"].columns:
+    # Location_Today2 on HP_DC_NAME
+    df = left_merge(df, Location_Today2, ["HP_DC_NAME"], ["HP_DC_NAME"])
+    if "Location_Today" in Location_Today2.columns:
         df = df.rename(columns={"Location_Today": "Location_Today_DC-Name-Based"})
 
-    # Final reorder (your PQ list; we keep what exists)
+    # Final reorder (keep what exists)
     final_order = [
         "PLANNER_UNIQUE_IDENTIFIER","CI_CATEGORY","PRODUCT_PORTFOLIO_NAR","IS_ACTUAL_DATABASE_CI","REPORTING_UNIT",
         "NAR_INSTANCE_ID","INSTANCE_NAME","CIO_MINUS_1","PORTFOLIO_OWNER","PORTFOLIO_OWNER_DELEGATE",
